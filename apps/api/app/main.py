@@ -8,14 +8,23 @@ from app.agent.loop import AgentLoop
 from app.agent.tools import ToolRegistry, make_iot_tools
 from app.config import Settings
 from app.iot.service import MockIoTService
+from app.llm.anthropic import AnthropicProvider
+from app.llm.base import LLMProvider
 from app.llm.deepseek import DeepSeekProvider
 from app.routers.chat import router as chat_router
 from app.state import set_agent, state
 
 
+def build_llm(settings: Settings) -> LLMProvider:
+    """按环境变量选 Provider：优先 Anthropic，其次 DeepSeek。"""
+    if settings.anthropic_api_key:
+        return AnthropicProvider(settings=settings)
+    return DeepSeekProvider(settings=settings)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # 启动时初始化默认 agent（DeepSeek + mock IoT）。
+    # 启动时初始化默认 agent（LLM + mock IoT）。
     # 测试可以通过 set_agent 在 TestClient 启动前注入 FakeProvider。
     if state.agent is None:
         iot = MockIoTService.with_seed_data()
@@ -23,8 +32,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for t in make_iot_tools(iot):
             registry.register(t)
         settings = Settings.from_env()
-        # DEEPSEEK_API_KEY 缺失时 DeepSeekProvider 构造抛 ValueError → 启动失败（快速失败）
-        agent = AgentLoop(llm=DeepSeekProvider(settings=settings), registry=registry)
+        # Provider 构造缺 key 会抛 ValueError → 启动失败（快速失败）
+        agent = AgentLoop(llm=build_llm(settings), registry=registry)
         set_agent(agent, iot)
     yield
 
