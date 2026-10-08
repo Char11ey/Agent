@@ -99,6 +99,18 @@ class AgentLoop:
 
     def _execute_tool(self, tc: ToolCall) -> Any:
         """执行工具。工具抛异常或不存在 → 返回错误 dict，供 LLM 继续推理。"""
+        # DeepSeekProvider 在 arguments 非法 JSON 时会塞进 __invalid_json__ 字段；
+        # 这里先于 handler 执行拦截，给 LLM 一个可读的诊断而不是底层 TypeError。
+        if "__invalid_json__" in tc.arguments:
+            raw = tc.arguments["__invalid_json__"]
+            return {
+                "ok": False,
+                "error": (
+                    f"invalid JSON in tool arguments for '{tc.name}': "
+                    f"model returned non-JSON arguments: {raw!r}. "
+                    "Please retry with a valid JSON object."
+                ),
+            }
         try:
             tool = self.registry.get(tc.name)
         except KeyError:

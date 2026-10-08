@@ -60,8 +60,41 @@ async def test_unknown_tool_yields_error_not_crash():
     assert "抱歉" in final_text
 
 
+async def test_invalid_tool_call_json_yields_clean_error():
+    """LLM 返回的 arguments 是非法 JSON → tool_result 里给出清晰诊断（不是神秘 TypeError）。"""
+    reg = ToolRegistry()
+    reg.register(Tool(
+        name="noop",
+        description="no-op",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda: {"ok": True},
+    ))
+    # 模拟 DeepSeekProvider 的降级路径：非法 JSON 会被塞进 __invalid_json__ 字段
+    scripted = [
+        LLMResponse(
+            text=None,
+            tool_calls=[ToolCall(id="c1", name="noop", arguments={"__invalid_json__": "{not valid json"})],
+            usage={},
+        ),
+        LLMResponse(text="工具参数格式不对，让我重试一下。", tool_calls=[], usage={}),
+    ]
+    llm = FakeProvider(responses=scripted)
+    loop = AgentLoop(llm=llm, registry=reg)
+    events = [e async for e in loop.stream("do something")]
+
+    tool_results = [e for e in events if e.kind == "tool_result"]
+    assert tool_results, "tool_result 事件必须发出"
+    # 关键：错误信息必须提及 JSON/参数，不能是 TypeError: unexpected keyword argument
+    error_str = str(tool_results[0].result).lower()
+    assert "json" in error_str or "invalid" in error_str, f"错误信息不够清晰: {tool_results[0].result}"
+    assert "unexpected keyword" not in error_str, "不应把底层 TypeError 直接透给 LLM"
+
+    # LLM 拿到错误后继续推理
+    assert len(llm.calls) == 2
+
+
 async def test_tool_exception_propagates_to_llm_not_loop_crash():
-    """工具抛 ValueError → 作为 tool result 回传 LLM，loop 不崩。"""
+    """工具抛 ValueError → 作为 tool result 回传 LLM，loop 不崩且 LLM 拿到错误后继续推理。"""
     reg = ToolRegistry()
 
     def boom(room: str, temperature: int) -> dict:
@@ -81,11 +114,24 @@ async def test_tool_exception_propagates_to_llm_not_loop_crash():
         ),
         LLMResponse(text="温度范围不对，需要 16-30 度。", tool_calls=[], usage={}),
     ]
-    loop = AgentLoop(llm=FakeProvider(responses=scripted), registry=reg)
+    llm = FakeProvider(responses=scripted)
+    loop = AgentLoop(llm=llm, registry=reg)
     events = [e async for e in loop.stream("把卧室调到 99 度")]
+
     # tool_result 事件里的 content 应包含错误信息
     tool_results = [e for e in events if e.kind == "tool_result"]
     assert any("temperature" in str(e.result) for e in tool_results)
+
+    # 关键：LLM 被再次调用（第二次），并且消息历史里带上了 tool 错误
+    assert len(llm.calls) == 2, "loop 应在 tool_result 后再次调用 LLM"
+    second_call_messages = llm.calls[1][0]
+    tool_msgs = [m for m in second_call_messages if m.get("role") == "tool"]
+    assert tool_msgs, "第二次 LLM 调用必须带 role=tool 的消息"
+    assert "temperature" in tool_msgs[0]["content"]
+
+    # 最终 LLM 给出了针对错误的回答
+    final_text = "".join(e.text or "" for e in events if e.kind == "text_delta")
+    assert "温度" in final_text
 
 
 async def test_max_iterations_prevents_infinite_loop():
